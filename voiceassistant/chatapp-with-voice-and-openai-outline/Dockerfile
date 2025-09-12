@@ -23,3 +23,13 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 # -----------------------------------------------------------------
 
 CMD ["python", "-u", "server.py"]
+
+# system deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+
+# python deps
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt \
+    && pip install --no-cache-dir openai-whisper torch --extra-index-url https://download.pytorch.org/whl/cpu

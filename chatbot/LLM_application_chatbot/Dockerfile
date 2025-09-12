@@ -10,6 +10,8 @@ COPY requirements.txt .
 # Install the dependencies and packages in the requirements file
 RUN pip install -r requirements.txt
 
+
+
 # Copy every content from the local file to the image
 COPY . .
 

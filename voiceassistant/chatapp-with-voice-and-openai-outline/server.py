@@ -1,95 +1,57 @@
-# server.py
-import base64
-import json
+# worker.py
 import os
-from flask import Flask, render_template, request, Response, jsonify
-from flask_cors import CORS
-from worker import speech_to_text, text_to_speech, openai_process_message
+import tempfile
+from io import BytesIO
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+import whisper
+from openai import OpenAI
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template("index.html")
+# ---------- OpenAI client (for Chat + TTS) ----------
+API_KEY = os.getenv("OPENAI_API_KEY")
+if not API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set.")
+client = OpenAI(api_key=API_KEY)
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True})
+# ---------- Whisper model (local STT) ----------
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")   # tiny|base|small|medium|large
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")  # "cpu" or "cuda"
+_whisper = whisper.load_model(WHISPER_MODEL, device=WHISPER_DEVICE)
 
-@app.route("/speech-to-text", methods=["POST", "OPTIONS"])
-def speech_to_text_route():
-    # Handle CORS preflight
-    if request.method == "OPTIONS":
-        return _cors_ok()
+def speech_to_text(audio_binary: bytes, language: str = "en") -> str:
+    """Local STT via Whisper (no API usage). Requires ffmpeg installed."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+        tmp.write(audio_binary)
+        tmp.flush()
+        result = _whisper.transcribe(tmp.name, language=language, fp16=False)
+    return (result.get("text") or "").strip()
 
-    try:
-        print("processing /speech-to-text")
+def text_to_speech(text: str, voice: str = "alloy", fmt: str = "mp3") -> bytes:
+    """
+    OpenAI TTS -> audio bytes. If you're out of API quota, either:
+      - switch to a local TTS, or
+      - temporarily skip TTS and only return text.
+    """
+    resp = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice=voice or "alloy",
+        input=text,
+        format=fmt,     # "mp3" | "wav" | "opus" | "pcm16"
+    )
+    return resp.read()
 
-        # Accept audio as multipart file "audio" OR raw body
-        audio_bytes = None
-        if "audio" in request.files:
-            audio_bytes = request.files["audio"].read()
-        else:
-            # raw body
-            audio_bytes = request.get_data(cache=False)
+def openai_process_message(user_message: str) -> str:
+    """Chat completion using a current small 4o-family model."""
+    system_prompt = (
+        "Act like a helpful personal assistant. Be concise and practical. "
+        "You can answer questions, translate, summarize, and recommend."
+    )
+    chat = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=600,
+    )
+    return chat.choices[0].message.content.strip()
 
-        if not audio_bytes:
-            return jsonify({"error": "No audio provided"}), 400
-
-        text = speech_to_text(audio_bytes)
-        return jsonify({"text": text or ""}), 200
-
-    except Exception as e:
-        print("speech-to-text error:", repr(e))
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/process-message", methods=["POST", "OPTIONS"])
-def process_message_route():
-    # Handle CORS preflight
-    if request.method == "OPTIONS":
-        return _cors_ok()
-
-    try:
-        payload = request.get_json(silent=True) or {}
-        user_message = (payload.get("userMessage") or "").strip()
-        voice = (payload.get("voice") or "alloy").strip()  # default to alloy for OpenAI TTS
-
-        if not user_message:
-            return jsonify({"error": "Missing 'userMessage'"}), 400
-
-        # LLM reply
-        openai_response_text = openai_process_message(user_message)
-        # Clean blank lines
-        openai_response_text = os.linesep.join([s for s in openai_response_text.splitlines() if s])
-
-        # TTS bytes -> base64 string (mp3 by default in worker.text_to_speech)
-        audio_bytes = text_to_speech(openai_response_text, voice)
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-        resp = {
-            "openaiResponseText": openai_response_text,
-            "openaiResponseSpeech": audio_b64,
-            # Optional: tell the front-end what MIME to expect if it wants to play inline
-            "audioMimeType": "audio/mpeg"
-        }
-        return app.response_class(
-            response=json.dumps(resp),
-            status=200,
-            mimetype="application/json"
-        )
-    except Exception as e:
-        print("process-message error:", repr(e))
-        return jsonify({"error": str(e)}), 500
-
-def _cors_ok():
-    # Small helper for preflight responses if your frontend sends OPTIONS
-    r = Response()
-    r.headers["Access-Control-Allow-Origin"] = "*"
-    r.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
-    r.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    return r
-
-if __name__ == "__main__":
-    # If you want auto-reload in dev: app.run(port=8000, host="0.0.0.0", debug=True)
-    app.run(port=8000, host="0.0.0.0")
